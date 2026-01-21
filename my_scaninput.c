@@ -2,14 +2,17 @@
 #include <errno.h>
 #include <signal.h>
 
-char *external_cmd[152]; // 152 indicates the number of rows
+char *external_cmd[200]; // 200 indicates the number of rows
 extern char input_string[50];
 extern char prompt[25];
 extern char *builtins[];
-pid_t pid;                                    // pid_t is defined in <sys/types.h>
-int status;                                   // Volatile to prevent CPU optimization issues in signal handling
-volatile sig_atomic_t minishell_sigchild = 0; // used to track whether a SIGCHLD signal (child process termination) has been received
-Slist *head = NULL;                           // head pointer for stopped process list
+extern pid_t pid;                                // pid_t is defined in <sys/types.h>
+extern int status;                               // Volatile to prevent CPU optimization issues in signal handling
+extern volatile sig_atomic_t minishell_sigchild; // used to track whether a SIGCHLD signal (child process termination) has been received
+extern volatile sig_atomic_t got_sigint;         // flag to indicate SIGINT received
+extern volatile sig_atomic_t got_sigtstp;        // flag to indicate SIGTST
+
+Slist *head = NULL; // head pointer for stopped process list
 
 // void own_signal_handler(int signum)
 // {
@@ -31,28 +34,28 @@ int extract_external_commands(char **external_commands) // fn for external comma
     int fd = open("ext_commands.txt", O_RDONLY);
     if (fd == -1)
     {
-        if (errno == EACCES){
+        if (errno == EACCES)
+        {
             perror("open");
             return FAILURE;
         }
     }
 
-    char ch, buff[30];
+    char ch, buff[200];
     int i = 0, j = 0;
 
-    for (int i = 0; i < 152; i++)
+    for (int i = 0; i < 200; i++)
         external_cmd[i] = NULL;
 
     while (read(fd, &ch, 1) > 0)
     {
-        if (ch != 13) // The ASCII value (13) is a Carriage Return (CR) control character(vs-code error fix)
-        {
+        if (i < (int)sizeof(buff) - 1)
             buff[i++] = ch;
-        }
 
-        if (ch == '\n')
+        if (ch == '\n' && i > 0)
         {
             buff[i - 1] = '\0';
+            if (i > 1 && buff[i - 2] == '\r') buff[i - 2] = '\0';//The issue was that ext_commands.txt uses Windows-style CRLF line endings (\r\n), causing each command string to include a trailing \r character.
             external_cmd[j] = malloc((strlen(buff) + 1) * sizeof(char)); // allocate memory
             strcpy(external_cmd[j], buff);                               // copy the commands to 2d array
 
@@ -64,6 +67,7 @@ int extract_external_commands(char **external_commands) // fn for external comma
     if (i > 0) // To include the command in the last line if it doesn't end with a newline
     {
         buff[i] = '\0';
+        if (i > 0 && buff[i - 1] == '\r') buff[i - 1] = '\0';
         external_cmd[j] = malloc((strlen(buff) + 1) * sizeof(char)); // allocate memory for last line
         strcpy(external_cmd[j], buff);
     }
@@ -78,7 +82,21 @@ int extract_external_commands(char **external_commands) // fn for external comma
 
 void scan_input(char *prompt, char *input_string)
 {
-    if(extract_external_commands(external_cmd)== FAILURE)
+    // signal(SIGINT, signal_handler);
+    // signal(SIGTSTP, signal_handler);
+    // signal(SIGCHLD, signal_handler);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTSTP, &sa, NULL);
+    sigaction(SIGCHLD, &sa, NULL);
+
+    if (extract_external_commands(external_cmd) == FAILURE)
     {
         printf("Error in extracting external commands\n");
         exit(EXIT_FAILURE);
@@ -87,10 +105,14 @@ void scan_input(char *prompt, char *input_string)
     while (1)
     {
         // Printing the prompt
-        printf("%s", prompt);
-        scanf("%[^\n]", input_string);
-        char ch;                          // to clear the buffer
-        while ((ch = getchar()) != '\n'); // to clear the buffer
+        printf("\n%s", prompt);
+        if (scanf("%[^\n]", input_string) != 1)
+        {
+            input_string[0] = '\0';
+        }
+        char ch; // to clear the buffer
+        while ((ch = getchar()) != '\n')
+            ; // to clear the buffer
 
         // If PS1 is used
         if (!strncmp(input_string, "PS1=", 4) && input_string[4] != ' ')
@@ -109,37 +131,54 @@ void scan_input(char *prompt, char *input_string)
 
                 if (pid > 0)
                 {
-                    waitpid(pid, &status, WUNTRACED); // parent is waiting for child process to complete
+                    waitpid(pid, &status, WUNTRACED);
 
-                    // In case the child process is stopped we add its pid to the linked list by inserting that pid
-                    /* add it to the job list here (safe to call malloc/strcpy). */
                     if (WIFSTOPPED(status))
                     {
+                        sigset_t set, old;
+                        sigemptyset(&set);
+                        sigaddset(&set, SIGCHLD);
+
+                        sigprocmask(SIG_BLOCK, &set, &old);
                         insert_at_first(pid, input_string);
+                        sigprocmask(SIG_SETMASK, &old, NULL);
                     }
-                }
-                else if (pid == 0) // This is child process
-                {
-                    execute_external_commands(input_string);
                 }
 
-                if (minishell_sigchild == 1) // If sigchild termination signal is received
-                {                            // Updated inside the SIGCHLD signal handler
-                    pid_t del_pid;
-                    while (del_pid = (waitpid(-1, &status, WNOHANG)) > 0)
+                else if (pid == 0) // This is child process
+                {
+                    signal(SIGINT, SIG_DFL); // make it default again
+                    signal(SIGTSTP, SIG_DFL);
+                    execute_external_commands(input_string); // call ext_execute fn
+                }
+
+                if (minishell_sigchild)
+                {
+                    pid_t dead;
+                    while ((dead = waitpid(-1, &status, WNOHANG)) > 0)
                     {
-                        if (WIFEXITED(status) || WIFSIGNALED(status))
-                        { // WIFEXITED = Checks if the child terminated normally
-                          // WIFSIGNALED = Checks if the child process was terminated by a signal
-                            delete_pid_node(del_pid);
-                        }
+                        delete_pid_node(dead);
                     }
                     minishell_sigchild = 0;
+                }
+
+                if (got_sigint)
+                {
+                    write(STDOUT_FILENO, "\n", 1);
+                    write(STDOUT_FILENO, prompt, strlen(prompt));
+                    got_sigint = 0;
+                }
+
+                if (got_sigtstp)
+                {
+                    write(STDOUT_FILENO, "\n", 1);
+                    write(STDOUT_FILENO, prompt, strlen(prompt));
+                    got_sigtstp = 0;
                 }
             }
             else
             {
-                printf("%s command not found\n", input_string);
+                printf(ANSI_COLOR_CYAN "cmd --> %s   type --> NO_COMMAND\n" ANSI_COLOR_RESET, cmd); // test
             }
             free(cmd);
         }
@@ -157,19 +196,33 @@ int check_command_type(char *command) // fn to check command type
     for (int i = 0; external_cmd[i] != NULL; i++)
     {
         // printf("COMMAND : %s \n", external_cmd[i]);
-        if (strcmp(external_cmd[i], command) == 0){
+        if (strcmp(external_cmd[i], command) == 0)
+        {
             return EXTERNAL;
         }
     }
     return NO_COMMAND;
 }
 
-char *get_command(char *input_string) // fn to get command from input string
+char *get_command(char *input)
 {
-    char *cmd = (char *)malloc(20); // max command size is 20
-    sscanf(input_string, "%s", cmd);
-    cmd = realloc(cmd, strlen(cmd) + 1);
-    return cmd;
+    static char empty[] = "";
+
+    if (!input || input[0] == '\0')
+        return empty;
+
+    char *cmd = malloc(20);
+    if (!cmd)
+        return empty;
+
+    if (sscanf(input, "%19s", cmd) != 1)
+    {
+        free(cmd);
+        return empty;
+    }
+
+    char *tmp = realloc(cmd, strlen(cmd) + 1);
+    return tmp ? tmp : cmd;
 }
 
 // int insert_first(Slist **head, pid_t pid, char *string)
@@ -185,7 +238,7 @@ void execute_internal_commands(char *input_string) // fn to execute internal com
 {
     if (!strncmp(input_string, "exit", 4))
     {
-        for (int i = 0; i < 152; i++)
+        for (int i = 0; i < 200; i++)
         {
             free(external_cmd[i]);
         }
@@ -230,9 +283,21 @@ void execute_internal_commands(char *input_string) // fn to execute internal com
         }
         else
         {
-            kill(head->pid, SIGCONT);
-            waitpid(head->pid, &status, WUNTRACED);
+            pid_t fg_pid = head->pid;
+            char *fg_cmd = strdup(head->string);
+            if (!fg_cmd)
+            {
+                printf("Memory allocation failed\n");
+                return;
+            }
+            kill(fg_pid, SIGCONT);
+            waitpid(fg_pid, &status, WUNTRACED);
             delete_first(&head);
+            if (WIFSTOPPED(status))
+            {
+                insert_at_first(fg_pid, fg_cmd);
+            }
+            free(fg_cmd);
         }
     }
     else if (!strcmp(input_string, "bg"))
@@ -267,55 +332,47 @@ void print_stop_process() // printing nodes
     return;
 }
 
-void insert_at_first(pid_t pid, char *input_string)
+void insert_at_first(pid_t cpid, char *cmd)
 {
-    Slist *newnode = (Slist *)malloc(sizeof(Slist));
-    if (head == NULL)
+    Slist *node = malloc(sizeof(Slist));
+    if (!node)
+        return;
+
+    node->pid = cpid;
+    node->string = malloc(strlen(cmd) + 1);
+    if (!node->string)
     {
-        newnode->pid = pid;
-        strcpy(newnode->string, input_string);
-        newnode->link = NULL;
-        head = newnode;
+        free(node);
+        return;
     }
-    else
-    {
-        Slist *temp = (Slist *)malloc(sizeof(Slist));
-        temp = head;
-        while (temp->link != NULL)
-        {
-            temp = temp->link;
-        }
-        temp->link = newnode;
-        newnode->pid = pid;
-        strcpy(newnode->string, input_string);
-        newnode->link = NULL;
-    }
+    strcpy(node->string, cmd);
+
+    node->link = head;
+    head = node;
 }
 
 int delete_pid_node(pid_t del_pid)
 {
-    if (head == NULL)
-        return FAILURE;
+    Slist *cur = head;
+    Slist *prev = NULL;
 
-    Slist *temp = (Slist *)malloc(sizeof(Slist));
-    Slist *prev = (Slist *)malloc(sizeof(Slist));
-    temp = head;
-    while (temp != NULL)
+    while (cur)
     {
-        prev = temp; // prev stores current position always
-        if (temp->pid == del_pid)
+        if (cur->pid == del_pid)
         {
-            if (temp == head)
-                head = temp->link;
+            if (prev)
+                prev->link = cur->link;
             else
-                prev->link = temp->link;
+                head = cur->link;
 
-            free(temp);
+            free(cur->string);
+            free(cur);
             return SUCCESS;
         }
-        temp = temp->link;
+        prev = cur;
+        cur = cur->link;
     }
-    return SUCCESS;
+    return FAILURE;
 }
 
 int delete_first(Slist **head)
@@ -325,98 +382,101 @@ int delete_first(Slist **head)
 
     Slist *temp = *head;
     *head = (*head)->link;
+    free(temp->string);
     free(temp);
     return SUCCESS;
 }
 
 // Functions to execute external & internal commands
-void execute_external_commands(char *input_string)
+void execute_external_commands(char *input)
 {
-    // Tokenizer
-    char *tokens[100];
-    int no_of_tokens  = 0;          // number of String tokens
+    char *tokens[64];
+    int nt = 0;
 
-    char *tmp = strdup(input_string); // strdup is dynamic memory allocator & copies the string with null char
+    char *tmp = strdup(input);
+    if (!tmp)
+        exit(1);
+
     char *p = strtok(tmp, " ");
-
-    while (p != NULL)
+    while (p && nt < 63)
     {
-        tokens[no_of_tokens ++] = strdup(p);
+        tokens[nt++] = strdup(p);
         p = strtok(NULL, " ");
     }
-    tokens[no_of_tokens] = NULL;
+    tokens[nt] = NULL;
     free(tmp);
 
-    int command_count = 1;
-    for (int i = 0; i < no_of_tokens ; i++)
-        if (strcmp(tokens[i], "|") == 0)
-            command_count++;
+    struct command cmds[10] = {0};
+    int ci = 0, ai = 0;
 
-    struct command cmds[10]; // assuming max 10 commands with pipes
-    for (int i = 0; i < 10; i++)
-        for (int j = 0; j < 20; j++)
-            cmds[i].argv[j] = NULL;
-
-    int no_of_pipes = 0, arg_i = 0;
-    for (int i = 0; i < no_of_tokens ; i++)         // parsing tokens into commands structure
+    for (int i = 0; i < nt; i++)
     {
-        if (strcmp(tokens[i], "|") == 0)
+        if (!strcmp(tokens[i], "|"))
         {
-            cmds[no_of_pipes].argv[arg_i] = NULL;
-            no_of_pipes++;
-            arg_i = 0;
+            if (ai == 0)
+            {
+                fprintf(stderr, "syntax error near '|'\n");
+                goto cleanup;
+            }
+            cmds[ci++].argv[ai] = NULL;
+            ai = 0;
         }
         else
         {
-            cmds[no_of_pipes].argv[arg_i++] = tokens[i];
+            if (ai >= 19) // argv[20] limit
+            {
+                fprintf(stderr, "minishell: too many arguments\n");
+                goto cleanup;
+            }
+            cmds[ci].argv[ai++] = tokens[i];
         }
     }
-    cmds[no_of_pipes].argv[arg_i] = NULL;
+    cmds[ci].argv[ai] = NULL;
+    int ncmds = ci + 1;
 
-    if (no_of_pipes == 0) // No Pipe Implementation
+    if (ncmds == 1)
     {
-        if (execvp(cmds[0].argv[0], cmds[0].argv) == -1)
-        {
-            perror("exec");
-            exit(1);
-        }
-        return;
+        execvp(cmds[0].argv[0], cmds[0].argv);
+        perror("execvp");
+        exit(1);
     }
 
-    // Pipe Implementation
-    int pipefd[10][2];
-    for (int i = 0; i < no_of_pipes; i++)
+    int pipefd[9][2];
+    for (int i = 0; i < ncmds - 1; i++)
         pipe(pipefd[i]);
 
-    for (int i = 0; i <= no_of_pipes; i++)
+    for (int i = 0; i < ncmds; i++)
     {
-        pid_t pid = fork();
-        if (pid == 0)
+        pid_t child = fork();
+        if (child == 0)
         {
             if (i > 0)
-            {
                 dup2(pipefd[i - 1][0], STDIN_FILENO);
-            }
-            if (i < no_of_pipes)
-            {
+            if (i < ncmds - 1)
                 dup2(pipefd[i][1], STDOUT_FILENO);
-            }
-            for (int j = 0; j < no_of_pipes; j++)
+
+            for (int j = 0; j < ncmds - 1; j++)
             {
                 close(pipefd[j][0]);
                 close(pipefd[j][1]);
             }
 
             execvp(cmds[i].argv[0], cmds[i].argv);
-            perror("exec");
+            perror("execvp");
             exit(1);
         }
     }
-    for (int j = 0; j < no_of_pipes; j++)
+
+    for (int i = 0; i < ncmds - 1; i++)
     {
-        close(pipefd[j][0]);
-        close(pipefd[j][1]);
+        close(pipefd[i][0]);
+        close(pipefd[i][1]);
     }
-    for (int i = 0; i <= no_of_pipes; i++)
+
+    for (int i = 0; i < ncmds; i++)
         wait(NULL);
+
+cleanup:
+    for (int i = 0; i < nt; i++)
+        free(tokens[i]);
 }

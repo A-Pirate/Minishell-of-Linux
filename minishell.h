@@ -1,16 +1,17 @@
 #ifndef MAIN_H
 #define MAIN_H
 
-#include <stdio.h>
+#include <stdio.h> //headers files
 #include <string.h>
+#include <stddef.h>
 #include <stdlib.h>
-#include <stdio_ext.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <errno.h>
 
 
 typedef struct sl       //structure for stopped process linked list
@@ -43,7 +44,6 @@ struct command          //Structure that holds array of commands inside array of
 
 void scan_input(char *prompt, char *input_string);
 char *get_command(char *input_string);
-
 void copy_change(char *prompt, char *input_string);
 int extract_external_commands(char **external_commands);
 
